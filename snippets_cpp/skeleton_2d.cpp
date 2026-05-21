@@ -13,6 +13,8 @@
 //          beneath the skeleton so it reads as a body rather than sticks.
 // • Pose — the full set of local_angle values can be written to / read from
 //          a text file, letting you snapshot and restore custom poses.
+// • Limit— optional per-joint [lo, hi] range (relative to rest) so FK drags
+//          and IK solves stay plausible; the rest angle is always inside it.
 //
 // Controls:
 //   Left-drag joint  — FK mode: rotate the picked bone
@@ -23,6 +25,7 @@
 //   K                — toggle skin (flesh capsules)
 //   N                — toggle bone name labels
 //   R                — reset to rest pose
+//   L                — toggle joint angle limits
 //   F5               — save current pose to skeleton_pose.txt
 //   F9               — load pose from skeleton_pose.txt
 //
@@ -65,6 +68,9 @@ struct Bone {
     Color       color;
     float       skin;         // flesh capsule radius; 0 = no skin
 
+    bool        limited;      // enforce [lo, hi] on local_angle?
+    float       lo, hi;       // absolute local_angle bounds (radians)
+
     // Computed by forward_kinematics()
     Vector2 world_head;
     Vector2 world_tail;
@@ -80,8 +86,29 @@ struct Skeleton {
     int add(int parent, float local_deg, float length,
             const char* name, Color col, float skin = 0.0f) {
         const float r = local_deg * kD2R;
-        bones.push_back({ parent, r, r, length, name, col, skin, {}, {}, 0.0f });
+        bones.push_back({ parent, r, r, length, name, col, skin,
+                          false, 0.0f, 0.0f, {}, {}, 0.0f });
         return (int)bones.size() - 1;
+    }
+
+    // Constrain a bone's local_angle to [rest+lo_off, rest+hi_off] (degrees).
+    // lo_off <= 0 <= hi_off keeps the rest pose valid.
+    void limit(int i, float lo_off_deg, float hi_off_deg) {
+        bones[i].limited = true;
+        bones[i].lo = bones[i].rest_angle + lo_off_deg * kD2R;
+        bones[i].hi = bones[i].rest_angle + hi_off_deg * kD2R;
+    }
+
+    void clamp_joint(int i) {
+        Bone& b = bones[i];
+        if (!b.limited) return;
+        // Map to the equivalent angle nearest rest, then clamp to the range.
+        b.local_angle = b.rest_angle + wrap_pi(b.local_angle - b.rest_angle);
+        b.local_angle = std::clamp(b.local_angle, b.lo, b.hi);
+    }
+
+    void clamp_all() {
+        for (int i = 0; i < (int)bones.size(); ++i) clamp_joint(i);
     }
 
     void forward_kinematics() {
@@ -117,7 +144,7 @@ struct Skeleton {
 struct IKChain { int effector, base; const char* name; };
 
 static void solve_ik_ccd(Skeleton& sk, const IKChain& c, Vector2 target,
-                         int iters = 12) {
+                         bool limits = true, int iters = 12) {
     for (int it = 0; it < iters; ++it) {
         int b = c.effector;
         while (true) {
@@ -128,6 +155,7 @@ static void solve_ik_ccd(Skeleton& sk, const IKChain& c, Vector2 target,
             const float a_tip = atan2f(tip.y    - joint.y, tip.x    - joint.x);
             const float a_tgt = atan2f(target.y - joint.y, target.x - joint.x);
             sk.bones[b].local_angle += wrap_pi(a_tgt - a_tip);
+            if (limits) sk.clamp_joint(b);
 
             if (b == c.base) break;
             b = sk.bones[b].parent;
@@ -208,6 +236,25 @@ static void draw_skeleton(const Skeleton& sk, int sel, bool names, bool skin) {
     }
 }
 
+// Draw a selected joint's allowed range as a wedge, plus its current angle.
+static void draw_joint_limit(const Skeleton& sk, int i) {
+    const Bone& b = sk.bones[i];
+    if (!b.limited) return;
+    const float base = b.world_angle - b.local_angle;  // parent world angle
+    const float r    = std::clamp(b.length * 0.6f, 24.0f, 42.0f);
+    const Vector2 c  = b.world_head;
+
+    DrawCircleSector(c, r, (base + b.lo) * kR2D, (base + b.hi) * kR2D,
+                     24, ColorAlpha(YELLOW, 0.12f));
+
+    auto spoke = [&](float ang, float th, Color col) {
+        DrawLineEx(c, { c.x + cosf(ang) * r, c.y + sinf(ang) * r }, th, col);
+    };
+    spoke(base + b.lo,    1.5f, ColorAlpha(YELLOW, 0.55f));
+    spoke(base + b.hi,    1.5f, ColorAlpha(YELLOW, 0.55f));
+    spoke(b.world_angle,  2.0f, ORANGE);                  // current angle
+}
+
 // Returns the closest bone index whose head is within 20px of the mouse.
 static int pick_bone(const Skeleton& sk, Vector2 mouse) {
     static constexpr float kMaxR2 = 20.0f * 20.0f;
@@ -262,15 +309,21 @@ static Skeleton build_humanoid(Vector2 center) {
     // Legs: ~105°/75° from hub's 0° = down-left/down-right
     int lthigh = sk.add(hub,   105, 48, "L.Thigh",    kLeg, 14);
     int lshin  = sk.add(lthigh, -15, 44, "L.Shin",    kLeg, 11);
-               sk.add(lshin,  -70,  24, "L.Foot",    kLeg,  8);
+    int lfoot  = sk.add(lshin,  -70, 24, "L.Foot",    kLeg,  8);
 
     int rthigh = sk.add(hub,    75, 48, "R.Thigh",    kLeg, 14);
     int rshin  = sk.add(rthigh,  15, 44, "R.Shin",    kLeg, 11);
-               sk.add(rshin,  -70,  24, "R.Foot",    kLeg,  8);
+    int rfoot  = sk.add(rshin,  -70, 24, "R.Foot",    kLeg,  8);
 
-    // All intermediate indices are used as parent args above; no orphans.
-    (void)luarm; (void)llarm; (void)ruarm; (void)rlarm;
-    (void)lthigh; (void)lshin; (void)rthigh; (void)rshin;
+    // Joint limits, in degrees relative to each bone's rest angle (tunable).
+    // Left/right pairs are mirrored.  Hub/spine/hands stay free.
+    sk.limit(neck,   -35,  35);
+    sk.limit(luarm, -120, 120);   sk.limit(ruarm, -120, 120);  // shoulders (loose)
+    sk.limit(llarm, -130,  15);   sk.limit(rlarm,  -15, 130);  // elbows (one-way)
+    sk.limit(lthigh, -55,  55);   sk.limit(rthigh, -55,  55);  // hips
+    sk.limit(lshin, -110,  15);   sk.limit(rshin,  -15, 110);  // knees (one-way)
+    sk.limit(lfoot,  -45,  45);   sk.limit(rfoot,  -45,  45);  // ankles
+    sk.limit(chest,  -35,  35);
 
     sk.forward_kinematics();
     return sk;
@@ -480,6 +533,7 @@ int main() {
     int   anim       = ANIM_OFF;
     bool  show_names = true;
     bool  show_skin  = true;
+    bool  use_limits = true;
     float anim_time  = 0.0f;
 
     float drag_start_local = 0.0f;
@@ -503,6 +557,7 @@ int main() {
         if (IsKeyPressed(KEY_A)) anim       = (anim + 1) % ANIM_COUNT;
         if (IsKeyPressed(KEY_K)) show_skin  = !show_skin;
         if (IsKeyPressed(KEY_N)) show_names = !show_names;
+        if (IsKeyPressed(KEY_L)) { use_limits = !use_limits; if (use_limits) sk.clamp_all(); }
         if (IsKeyPressed(KEY_R)) { sk.reset_pose(); anim = ANIM_OFF; sel = sel_chain = -1; }
 
         if (IsKeyPressed(KEY_F5))
@@ -533,7 +588,7 @@ int main() {
 
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
             if (ik_mode && sel_chain >= 0) {
-                solve_ik_ccd(sk, kChains[sel_chain], mouse);
+                solve_ik_ccd(sk, kChains[sel_chain], mouse, use_limits);
             } else if (!ik_mode && sel >= 0) {
                 const Vector2& h = sk.bones[sel].world_head;
                 const float dx = mouse.x - h.x;
@@ -541,6 +596,7 @@ int main() {
                 if (dx*dx + dy*dy > 9.0f) {
                     const float cur = atan2f(dy, dx);
                     sk.bones[sel].local_angle = drag_start_local + (cur - drag_start_mang);
+                    if (use_limits) sk.clamp_joint(sel);
                 }
             }
         }
@@ -555,6 +611,7 @@ int main() {
             anim_time += dt * 1.6f;            // ~0.63s per full cycle
             apply_walk(sk, anim_time);
         }
+        if (anim != ANIM_OFF && use_limits) sk.clamp_all();
 
         if (status_t > 0.0f) status_t -= dt;
 
@@ -578,6 +635,10 @@ int main() {
 
         draw_skeleton(sk, sel, show_names, show_skin);
 
+        // Selected joint's allowed range (FK mode)
+        if (!ik_mode && sel >= 0 && use_limits)
+            draw_joint_limit(sk, sel);
+
         // IK effector handles
         if (ik_mode) {
             for (int i = 0; i < kChainCount; ++i) {
@@ -599,9 +660,10 @@ int main() {
                                          : "Left-drag joint = rotate bone (FK)";
         DrawText(drag_hint,                       tx, ty, ts, GRAY); ty += 19;
         DrawText("Right-click = deselect",        tx, ty, ts, GRAY); ty += 19;
-        DrawText("I = FK/IK   A = animation",     tx, ty, ts, GRAY); ty += 19;
-        DrawText("K = skin    N = names  R = rest", tx, ty, ts, GRAY); ty += 19;
-        DrawText("F5 = save pose  F9 = load pose", tx, ty, ts, GRAY); ty += 26;
+        DrawText("I = FK/IK   A = animation",      tx, ty, ts, GRAY); ty += 19;
+        DrawText("K = skin   N = names   L = limits", tx, ty, ts, GRAY); ty += 19;
+        DrawText("R = rest pose",                   tx, ty, ts, GRAY); ty += 19;
+        DrawText("F5 = save pose  F9 = load pose",  tx, ty, ts, GRAY); ty += 26;
 
         DrawText(TextFormat("Mode : %s", ik_mode ? "IK" : "FK"),
                  tx, ty, ts, ik_mode ? SKYBLUE : LIGHTGRAY); ty += 19;
@@ -615,15 +677,25 @@ int main() {
             DrawText(TextFormat("Bone : %s", sn),
                      tx, ty, ts, sel >= 0 ? YELLOW : LIGHTGRAY); ty += 19;
             if (sel >= 0) {
-                DrawText(TextFormat("local_ang: %.1f deg", sk.bones[sel].local_angle * kR2D),
+                const Bone& sb = sk.bones[sel];
+                DrawText(TextFormat("local_ang: %.1f deg", sb.local_angle * kR2D),
                          tx, ty, ts, YELLOW); ty += 19;
+                if (sb.limited)
+                    DrawText(TextFormat("range : [%.0f, %.0f] deg",
+                                 (sb.lo - sb.rest_angle) * kR2D,
+                                 (sb.hi - sb.rest_angle) * kR2D),
+                             tx, ty, ts, ORANGE);
+                else
+                    DrawText("range : free", tx, ty, ts, LIGHTGRAY);
+                ty += 19;
             }
         }
 
         DrawText(TextFormat("Anim : %s", anim_name(anim)),
                  tx, ty, ts, anim != ANIM_OFF ? GREEN : LIGHTGRAY); ty += 19;
-        DrawText(TextFormat("Skin : %s", show_skin ? "on" : "off"),
-                 tx, ty, ts, show_skin ? GREEN : LIGHTGRAY);
+        DrawText(TextFormat("Skin : %s   Limits : %s",
+                            show_skin ? "on" : "off", use_limits ? "on" : "off"),
+                 tx, ty, ts, LIGHTGRAY);
 
         if (status_t > 0.0f)
             DrawText(status, tx, GetScreenHeight() - 28, 18,
