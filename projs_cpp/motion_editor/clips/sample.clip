@@ -1,0 +1,29 @@
+# motion clip v1
+# 範例：正面直拳。數值以「面向 +x（前方）」撰寫，正負號慣例見 MOTION_AUTHORING.md 第 3 節。
+name punch
+duration 0.45
+facing relative
+loop false
+spring 240 20
+
+key 0.00 ease_out
+  root 0 0
+
+key 0.30 ease_in            # 蓄力底：手往後拉、屈肘、軀幹後仰
+  NUARM 18
+  NFARM -50
+  FUARM -6
+  SPINE -5
+  CHEST -3
+
+key 0.55 ease_out           # 出拳：上臂前伸、伸直、軀幹前傾、前衝
+  NUARM -95
+  NFARM 8
+  FUARM 22
+  FFARM -15
+  SPINE 6
+  CHEST 4
+  root 26 0
+
+key 1.00 linear             # 收勢：所有偏移回 rest（未列骨頭自動歸 0）
+  root 0 0
