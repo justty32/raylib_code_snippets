@@ -4,6 +4,9 @@
 *.o
 *.obj
 
+# Snippet runtime artifacts
+skeleton_pose.txt
+
 # CMake build directories
 build/
 build_mingw/
