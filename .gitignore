@@ -1,0 +1,27 @@
+# Build outputs
+*.exe
+*.dll
+*.o
+*.obj
+
+# CMake build directories
+build/
+build_mingw/
+**/build/
+**/build_mingw/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+
+# MSVC / IDE
+.vs/
+*.vcxproj.user
+*.sln.user
+out/
+
+# Third-party libraries cloned as standalone repos (use submodules if needed)
+raylib/
+raylib-cpp/
+imgui/
